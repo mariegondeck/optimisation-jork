@@ -1,0 +1,4 @@
+[[pages]]
+path = "pages/geo.py"
+name = "Geo data"
+icon = "🎯"

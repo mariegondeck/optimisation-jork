@@ -1,0 +1,34 @@
+# ============================================================
+# jork-pv-optimizer – Python dependencies
+# Tested with Python 3.11
+# Install with:  pip install -r requirements.txt
+# ============================================================
+
+# --- GIS & Spatial ---
+osmnx==1.9.4              # OpenStreetMap building/street fetching
+geopandas==0.14.4         # GeoDataFrames, spatial operations
+shapely==2.0.4            # Geometry primitives (used by geopandas)
+pyproj==3.6.1             # CRS transformations (EPSG:25832 etc.)
+pvlib==0.11.2             # Solar position, PV performance modelling (optional, for more detailed PV output estimates)
+
+# --- Data ---
+pandas==2.2.2
+numpy==1.26.4
+requests==2.32.3          # PVGIS REST API calls
+
+# --- Optimisation ---
+pulp==2.8.0               # LP/MIP modelling (CBC solver bundled)
+# CBC solver is included in PuLP – no separate install needed
+# If you want GLPK instead: brew install glpk  (macOS)
+#                            sudo apt install glpk-utils  (Linux)
+
+# --- Visualisation ---
+streamlit>=1.36.0         # Web app framework
+folium==0.16.0            # Interactive Leaflet maps
+streamlit-folium==0.20.0  # Folium ↔ Streamlit bridge
+plotly==5.22.0            # Time-series charts (irradiance, PV output)
+matplotlib==3.9.0         # Static fallback plots if needed
+
+# --- Utilities ---
+python-dotenv==1.0.1      # Optional: store API keys in .env
+tqdm==4.66.4              # Progress bars for long fetches
