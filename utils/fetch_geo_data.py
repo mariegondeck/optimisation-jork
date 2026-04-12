@@ -28,7 +28,8 @@ PLACE_NAME = "Jork, Landkreis Stade, Niedersachsen, Germany"
 JORK_LAT = 53.5283
 JORK_LON = 9.6872
 
-DATA_DIR = Path("data/raw")
+ROOT = Path(__file__).resolve().parent.parent  # geht von utils/ zwei Ebenen hoch
+DATA_DIR = ROOT / "data" / "raw"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 # ---------------------------------------------------------------------------
