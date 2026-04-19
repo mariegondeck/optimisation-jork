@@ -1,0 +1,9 @@
+[[pages]]
+path = "pages/intro.py"
+name = "Introduction Jork"
+icon = "🍎"
+
+[[pages]]
+path = "pages/optimiser.py"
+name = "PV optimiser"
+icon = "🎯"

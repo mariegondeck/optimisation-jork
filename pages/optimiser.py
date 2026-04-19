@@ -19,16 +19,6 @@ import plotly.express as px
 ROOT = Path(__file__).resolve().parent.parent
 
 # ---------------------------------------------------------------------------
-# Page config
-# ---------------------------------------------------------------------------
-st.set_page_config(
-    page_title="Jork PV Optimiser",
-    page_icon="☀️",
-    layout="wide",
-    initial_sidebar_state="collapsed",
-)
-
-# ---------------------------------------------------------------------------
 # Custom CSS
 # ---------------------------------------------------------------------------
 st.markdown("""
@@ -103,23 +93,14 @@ gdf_results = load_results()
 gdf_all     = load_pv_potential()
 pvgis_df    = load_pvgis()
 
-# ---------------------------------------------------------------------------
-# Header
-# ---------------------------------------------------------------------------
-st.markdown("""
-<div class="header-banner">
-  <h1>☀️ Jork · Altes Land — PV Rooftop Optimiser</h1>
-  <p>Binary optimisation over 6,000+ buildings · OpenStreetMap · PVGIS · CBC Solver</p>
-</div>
-""", unsafe_allow_html=True)
 
 # ---------------------------------------------------------------------------
 # Tabs
 # ---------------------------------------------------------------------------
 tab_map, tab_chart, tab_table = st.tabs([
-    "🗺️  Map — PV Potential & Results",
-    "📈  Irradiance — Time Series",
-    "📋  Data — Selected Buildings",
+    "🗺️  Map: PV Potential & Results",
+    "📈  Irradiance: Time Series",
+    "📋  Data: Selected Buildings",
 ])
 
 # ===========================================================================

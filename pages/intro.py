@@ -87,7 +87,7 @@ st.markdown("""
 col_left, col_right = st.columns([1, 1], gap="large")
 
 with col_left:
-    st.markdown("### 📍 The Place")
+    st.markdown("### 📍 Jork")
 
     # Images
     def img_to_base64(path):
@@ -102,18 +102,18 @@ with col_left:
         st.markdown(f"""
         <div style="text-align:center">
           <img src="data:image/jpeg;base64,{img1}"
-               style="width:300px; height:300px; object-fit:cover; border-radius:50%;
+               style="width:250px; height:250px; object-fit:cover; border-radius:50%;
                       border:3px solid #2e7d32; box-shadow:0 4px 12px rgba(0,0,0,0.15);">
-          <p style="font-size:0.7rem; color:#666; margin-top:0.5rem;">Jork Rathaus</p>
+          <p style="font-size:1.5rem; color:#666; margin-top:0.5rem;">Town Hall</p>
         </div>
         """, unsafe_allow_html=True)
     with img_col2:
         st.markdown(f"""
         <div style="text-align:center">
           <img src="data:image/jpeg;base64,{img2}"
-               style="width:300px; height:300px; object-fit:cover; border-radius:50%;
+               style="width:250px; height:250px; object-fit:cover; border-radius:50%;
                       border:3px solid #2e7d32; box-shadow:0 4px 12px rgba(0,0,0,0.15);">
-          <p style="font-size:0.7rem; color:#666; margin-top:0.5rem;">Obsthof, Altes Land</p>
+          <p style="font-size:1.5rem; color:#666; margin-top:0.5rem;">Thatched House</p>
         </div>
         """, unsafe_allow_html=True)
 
