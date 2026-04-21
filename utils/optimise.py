@@ -1,251 +1,331 @@
 """
-utils/optimizer.py
+utils/optimise.py
 
-Solves a binary optimisation problem:
-  Which subset of rooftops in Jork / Altes Land should receive PV panels
-  to maximise annual energy yield, subject to practical constraints?
+MILP core for PV rooftop investment optimisation with hourly dispatch.
+This module is a library — it is called by scenario_builder.py.
+Do not run this file directly.
 
-Formulation:
-  Variables:   x_i ∈ {0, 1}   for each building i
-  Objective:   maximise  Σ_i  x_i · pv_yield_kwh_yr_i
-  Constraints:
-    (1) Total installed peak power  ≤  max_peak_power_kwp
-    (2) Total number of buildings   ≥  min_buildings          (optional)
-    (3) Orchards excluded           →  x_i = 0 for orchard buildings
-    (4) Max investment cost         ≤  max_cost_eur           (optional)
+=============================================================================
+PROBLEM FORMULATION
+=============================================================================
 
-Solver: CBC (bundled with PuLP – no separate install needed)
+Decision variables:
+  x_i   ∈ {0,1}         binary: install PV on building i or not
+  s_i   ∈ [0, s_max_i]  continuous: installed PV capacity [kWp]
+  g_i,t ≥ 0             grid import [kWh] for building i in hour t
+  e_i,t ≥ 0             grid export / feed-in [kWh] for building i in hour t
+  p_i,t ≥ 0             local PV consumption [kWh] for building i in hour t
+
+Objective (minimise total annual costs):
+  min  Σ_i [ x_i · CAPEX_fix  +  s_i · CAPEX_kwp ]
+     + Σ_i Σ_season Σ_h  w · [ g_i,t · c_grid  −  e_i,t · c_feedin ]
+
+  w = DAYS_PER_SEASON ≈ 91.25  (scales one representative day to full season)
+
+Constraints:
+  (1)  p_i,t + g_i,t = demand_i,t        ∀i,t   energy balance
+  (2)  p_i,t + e_i,t ≤ s_i · CF_t        ∀i,t   PV output limit
+  (3)  s_i ≤ s_max_i · x_i               ∀i     capacity only if installed
+  (4)  s_i ≥ s_min · x_i                 ∀i     minimum viable system
+  (5)  Σ_i s_i ≤ max_total_kwp                   grid capacity constraint
+  (6)  x_i = 0 for orchard buildings             No Net Land Take
 
 Sources:
-  - PuLP docs:         https://coin-or.github.io/pulp/
-  - CBC solver:        https://github.com/coin-or/Cbc
-  - Cost assumption:   ~1000 EUR/kWp (utility-scale residential, Germany 2024)
-    Bundesnetzagentur, Photovoltaik-Monitoring 2024
-    https://www.bundesnetzagentur.de
+  - MILP formulation: inspired by MANGO (Mavromatidis & Petkov, 2021)
+    Applied Energy 288. https://doi.org/10.1016/j.apenergy.2021.116585
+  - Grid price (Germany 2024): Bundesnetzagentur Monitoringbericht 2024
+  - Feed-in tariff (EEG 2024, ≤10 kWp): bundesnetzagentur.de/eeg
+  - PV cost: Bundesnetzagentur PV-Monitoring 2024
+  - Solver: CBC via PuLP. https://coin-or.github.io/pulp/
 """
 
 import geopandas as gpd
 import pandas as pd
+import numpy as np
 import pulp
-from pathlib import Path
 
 # ---------------------------------------------------------------------------
-# Paths
+# Economic parameters
 # ---------------------------------------------------------------------------
-ROOT      = Path(__file__).resolve().parent.parent
-DATA_DIR  = ROOT / "data" / "processed"
-OUT_DIR   = ROOT / "data" / "processed"
+CAPEX_FIX_EUR    = 500.0    # fixed cost per installation [€]
+CAPEX_KWP_EUR    = 1000.0   # variable cost per kWp [€/kWp]
+C_GRID_EUR_KWH   = 0.29     # grid import price [€/kWh], Bundesnetzagentur 2024
+C_FEEDIN_EUR_KWH = 0.01     # conservative Direktvermarktung spot price [€/kWh]
+# Rationale: With true Nulleinspeisung (c_feedin=0), the optimizer installs
+# exactly as much PV as can be consumed locally → zero summer surplus by design.
+# A small value (1 ct/kWh) reflects conservative Direktvermarktung at spot prices
+# (~3-8 ct/kWh realistically, modelled conservatively here at 1 ct/kWh).
+# This incentivises slightly larger installations that naturally create summer
+# surplus while still strongly favouring self-consumption over export.
+# Source: Finanztip (2026), Bundeswirtschaftsministerium EEG-Novelle
+# https://www.finanztip.de/photovoltaik/einspeiseverguetung/
+S_MIN_KWP        = 1.0      # minimum viable system size [kWp]
 
-# ---------------------------------------------------------------------------
-# Cost assumption
-# ---------------------------------------------------------------------------
+# Capital Recovery Factor — annualises CAPEX so all costs are in €/yr
+# CRF = r(1+r)^n / ((1+r)^n - 1)
+# Method: standard in ESM, follows MANGO (Mavromatidis & Petkov, 2021)
+DISCOUNT_RATE   = 0.05     # 5% — typical residential PV in Germany
+SYSTEM_LIFETIME = 20       # years — standard PV panel lifetime
+CRF = (DISCOUNT_RATE * (1 + DISCOUNT_RATE) ** SYSTEM_LIFETIME) / \
+      ((1 + DISCOUNT_RATE) ** SYSTEM_LIFETIME - 1)
+# CRF ≈ 0.0802 → 1,000 € CAPEX becomes ~80 €/yr annualised
 
-# Approximate installed cost per kWp (Germany, small rooftop, 2024)
-# Source: Bundesnetzagentur Photovoltaik-Monitoring 2024
-COST_PER_KWP_EUR = 1000.0
-
-
-# ---------------------------------------------------------------------------
-# Load data
-# ---------------------------------------------------------------------------
-
-def load_pv_potential() -> gpd.GeoDataFrame:
-    path = DATA_DIR / "pv_potential_jork.gpkg"
-    if not path.exists():
-        raise FileNotFoundError(
-            f"PV potential file not found: {path}\n"
-            "Run solar_potential.py first."
-        )
-    gdf = gpd.read_file(path)
-    print(f"[Optimizer] Loaded {len(gdf)} buildings with PV potential")
-    return gdf
+SEASONS         = ["winter", "spring", "summer", "autumn"]
+HOURS           = list(range(24))
+DAYS_PER_SEASON = 365.0 / 4
 
 
 # ---------------------------------------------------------------------------
-# Core optimisation function
+# Core optimisation function  (called by scenario_builder.py)
 # ---------------------------------------------------------------------------
 
 def optimise(
     gdf: gpd.GeoDataFrame,
-    max_peak_power_kwp: float = 5000.0,   # constraint (1): max total kWp
-    min_buildings: int        = 10,        # constraint (2): min buildings selected
-    exclude_orchards: bool    = True,      # constraint (3): no orchard roofs
-    max_cost_eur: float       = None,      # constraint (4): optional budget cap
-    cost_per_kwp: float       = COST_PER_KWP_EUR,
+    max_total_kwp: float   = 5000.0,
+    exclude_orchards: bool = True,
+    capex_fix: float       = CAPEX_FIX_EUR,
+    capex_kwp: float       = CAPEX_KWP_EUR,
+    c_grid: float          = C_GRID_EUR_KWH,
+    c_feedin: float        = C_FEEDIN_EUR_KWH,
+    s_min: float           = S_MIN_KWP,
+    top_n: int             = 200,
+    solver_msg: bool       = False,
 ) -> gpd.GeoDataFrame:
     """
-    Run the binary integer programme and return the input GeoDataFrame
-    enriched with a boolean column `selected` indicating which buildings
-    were chosen by the solver.
+    Run the MILP and return GeoDataFrame enriched with result columns:
+      selected            bool   – building chosen
+      s_opt_kwp           float  – optimal installed capacity [kWp]
+      capex_eur           float  – investment cost [€]
+      annual_cost_eur     float  – net annual cost (grid - feedin) [€/yr]
+      pv_yield_opt_kwh_yr float  – annual yield at optimal capacity [kWh/yr]
 
     Parameters
     ----------
-    gdf                : GeoDataFrame from solar_potential.py
-    max_peak_power_kwp : maximum total installed capacity [kWp]
-    min_buildings      : minimum number of buildings that must be selected
-    exclude_orchards   : if True, buildings on orchard land are forced to 0
-    max_cost_eur       : optional maximum total investment cost [EUR]
-    cost_per_kwp       : installation cost per kWp [EUR/kWp]
-
-    Returns
-    -------
-    GeoDataFrame with added columns:
-        selected        : bool  – chosen by optimizer
-        cost_eur        : float – estimated installation cost per building
-        pv_yield_kwh_yr : already present, repeated here for clarity
+    gdf    : merged GeoDataFrame with pv_* and demand_* hourly columns
+    top_n  : pre-filter to top-N buildings by PV yield (solver speed)
     """
-    gdf = gdf.copy()
-    gdf["cost_eur"] = gdf["peak_power_kwp"] * cost_per_kwp
+    # ------------------------------------------------------------------
+    # Initialise result columns on full GeoDataFrame
+    # ------------------------------------------------------------------
+    gdf_full = gdf.copy()
+    for col, val in [("selected", False), ("s_opt_kwp", 0.0),
+                     ("capex_eur", 0.0), ("capex_annualised_eur", 0.0),
+                     ("annual_cost_eur", 0.0), ("total_annual_cost_eur", 0.0),
+                     ("pv_yield_opt_kwh_yr", 0.0),
+                     ("grid_import_kwh_yr", 0.0),
+                     ("pv_consumed_kwh_yr", 0.0),
+                     ("pv_exported_kwh_yr", 0.0)]:
+        gdf_full[col] = val
 
-    n = len(gdf)
-    indices = list(range(n))
+    # ------------------------------------------------------------------
+    # Pre-filter to top-N by PV yield
+    # ------------------------------------------------------------------
+    if "pv_yield_kwh_yr" not in gdf_full.columns:
+        raise ValueError("Missing 'pv_yield_kwh_yr'. Run solar_potential.py first.")
 
-    # -------------------------------------------------------------------
-    # Build PuLP model
-    # -------------------------------------------------------------------
-    model = pulp.LpProblem("JorkPV_RoofOptimiser", pulp.LpMaximize)
+    # Pre-filter: top-N from existing buildings + ALL new buildings
+    # This ensures new buildings always enter the solver regardless of size.
+    # Add original index before filtering so we can merge back later
+    gdf_full["_orig_idx"] = gdf_full.index
 
-    # Binary decision variables: x[i] = 1 → install PV on building i
-    x = [pulp.LpVariable(f"x_{i}", cat="Binary") for i in indices]
+    if "is_new" in gdf_full.columns:
+        new_bldgs      = gdf_full[gdf_full["is_new"] == True]
+        existing_bldgs = gdf_full[gdf_full["is_new"] == False]
+        # Take top-N from existing AND top-N from new buildings separately
+        # so both groups are equally represented regardless of size
+        top_existing = existing_bldgs.nlargest(top_n, "pv_yield_kwh_yr")
+        top_new      = new_bldgs.nlargest(top_n, "pv_yield_kwh_yr")                        if len(new_bldgs) > 0 else new_bldgs
+        sub = pd.concat([top_existing, top_new], ignore_index=True)
+    else:
+        sub = gdf_full.nlargest(top_n, "pv_yield_kwh_yr")
+    sub = sub.reset_index(drop=True)
+    n   = len(sub)
+    print(f"  [MILP] Solving over {n} buildings (pre-filtered from {len(gdf_full):,})")
 
-    # Objective: maximise total annual PV yield
-    model += pulp.lpSum(
-        x[i] * gdf.iloc[i]["pv_yield_kwh_yr"] for i in indices
-    ), "Total_PV_Yield"
+    # ------------------------------------------------------------------
+    # Orchard exclusion
+    # ------------------------------------------------------------------
+    orchard_mask = pd.Series(False, index=sub.index)
+    if exclude_orchards and "building" in sub.columns:
+        orchard_types = {"farm", "barn", "greenhouse", "stable"}
+        orchard_mask  = sub["building"].str.lower().isin(orchard_types)
 
-    # Constraint (1): total peak power cap
+    # ------------------------------------------------------------------
+    # Check hourly columns
+    # ------------------------------------------------------------------
+    has_hourly = all(
+        f"demand_{s}_h{h:02d}" in sub.columns and f"pv_{s}_h{h:02d}" in sub.columns
+        for s in SEASONS for h in HOURS
+    )
+    if not has_hourly:
+        raise ValueError(
+            "Missing hourly columns. Run solar_potential.py and energy_demand.py first."
+        )
+
+    # ------------------------------------------------------------------
+    # Build model
+    # ------------------------------------------------------------------
+    model = pulp.LpProblem("JorkPV_HourlyDispatch", pulp.LpMinimize)
+
+    x = [pulp.LpVariable(f"x_{i}", cat="Binary") for i in range(n)]
+    s = [pulp.LpVariable(f"s_{i}", lowBound=0,
+                         upBound=float(sub.iloc[i]["peak_power_kwp"]))
+         for i in range(n)]
+
+    g, e, p = {}, {}, {}
+    for i in range(n):
+        g[i], e[i], p[i] = {}, {}, {}
+        for season in SEASONS:
+            g[i][season], e[i][season], p[i][season] = {}, {}, {}
+            for h in HOURS:
+                tag = f"{i}_{season}_{h}"
+                g[i][season][h] = pulp.LpVariable(f"g_{tag}", lowBound=0)
+                e[i][season][h] = pulp.LpVariable(f"e_{tag}", lowBound=0)
+                p[i][season][h] = pulp.LpVariable(f"p_{tag}", lowBound=0)
+
+    # Objective: minimise ANNUALISED CAPEX + annual grid costs
+    # CAPEX × CRF converts one-off investment to equivalent annual cost [€/yr]
+    # so all terms are in €/yr and directly comparable.
+    # Method: MANGO (Mavromatidis & Petkov, 2021), Applied Energy 288
     model += (
-        pulp.lpSum(x[i] * gdf.iloc[i]["peak_power_kwp"] for i in indices)
-        <= max_peak_power_kwp,
-        "Max_Peak_Power"
+        pulp.lpSum(CRF * (capex_fix * x[i] + capex_kwp * s[i]) for i in range(n))
+        + pulp.lpSum(
+            DAYS_PER_SEASON * (c_grid * g[i][season][h] - c_feedin * e[i][season][h])
+            for i in range(n) for season in SEASONS for h in HOURS
+        ),
+        "Total_Annual_Cost_EUR_per_yr"
     )
 
-    # Constraint (2): minimum number of buildings
-    model += (
-        pulp.lpSum(x[i] for i in indices) >= min_buildings,
-        "Min_Buildings"
-    )
+    # Constraints
+    for i in range(n):
+        row    = sub.iloc[i]
+        s_max  = float(row["peak_power_kwp"])
 
-    # Constraint (3): exclude orchard buildings (No Net Land Take principle)
-    if exclude_orchards and "building" in gdf.columns:
-        orchard_mask = gdf["building"].str.lower().isin(
-            ["farm", "barn", "greenhouse", "stable"]
-        )
-        # Note: OSM doesn't tag buildings as "orchard" – we proxy by building
-        # types typically found on orchard land in the Altes Land region.
-        # A more precise approach would spatially join buildings with the
-        # orchard landuse polygons from fetch_gis_data.py → fetch_landuse().
-        orchard_idx = gdf[orchard_mask].index.tolist()
-        for i, idx in enumerate(gdf.index):
-            if idx in orchard_idx:
-                model += (x[i] == 0, f"ExcludeOrchard_{i}")
-        print(f"[Optimizer] Excluded {len(orchard_idx)} orchard-type buildings")
+        model += (s[i] <= s_max  * x[i], f"cap_max_{i}")
+        model += (s[i] >= s_min  * x[i], f"cap_min_{i}")
 
-    # Constraint (4): optional investment budget cap
-    if max_cost_eur is not None:
-        model += (
-            pulp.lpSum(x[i] * gdf.iloc[i]["cost_eur"] for i in indices)
-            <= max_cost_eur,
-            "Max_Investment_Cost"
-        )
-        print(f"[Optimizer] Budget cap: {max_cost_eur:,.0f} EUR")
+        if orchard_mask.iloc[i]:
+            model += (x[i] == 0, f"orchard_{i}")
 
-    # -------------------------------------------------------------------
+        for season in SEASONS:
+            for h in HOURS:
+                d  = float(row.get(f"demand_{season}_h{h:02d}", 0))
+                cf = float(row.get(f"pv_{season}_h{h:02d}", 0))
+
+                model += (p[i][season][h] + g[i][season][h] == d,
+                          f"bal_{i}_{season}_{h}")
+                model += (p[i][season][h] + e[i][season][h] <= s[i] * cf,
+                          f"pv_{i}_{season}_{h}")
+
+    model += (pulp.lpSum(s[i] for i in range(n)) <= max_total_kwp, "kwp_limit")
+
+    # ------------------------------------------------------------------
     # Solve
-    # -------------------------------------------------------------------
-    print(f"\n[Optimizer] Solving with CBC …")
-    solver = pulp.PULP_CBC_CMD(msg=False)   # msg=False → suppress CBC log
-    status = model.solve(solver)
+    # ------------------------------------------------------------------
+    print(f"  [MILP] {len(model.variables()):,} variables · "
+          f"{len(model.constraints):,} constraints")
+    solver = pulp.PULP_CBC_CMD(msg=solver_msg)
+    model.solve(solver)
 
-    print(f"[Optimizer] Status:  {pulp.LpStatus[model.status]}")
-    print(f"[Optimizer] Solver:  CBC (bundled with PuLP)")
+    status = pulp.LpStatus[model.status]
+    print(f"  [MILP] Status: {status}")
+    if status != "Optimal":
+        raise RuntimeError(f"No optimal solution: {status}")
 
-    if pulp.LpStatus[model.status] != "Optimal":
-        raise RuntimeError(
-            f"Solver did not find an optimal solution. Status: "
-            f"{pulp.LpStatus[model.status]}\n"
-            "Try relaxing the constraints (e.g. lower min_buildings "
-            "or raise max_peak_power_kwp)."
+    # ------------------------------------------------------------------
+    # Extract results into sub
+    # ------------------------------------------------------------------
+    sub["selected"]  = [bool(round(pulp.value(x[i]) or 0)) for i in range(n)]
+    sub["s_opt_kwp"] = [max(pulp.value(s[i]) or 0, 0)      for i in range(n)]
+    sub["capex_eur"] = [
+        (capex_fix + capex_kwp * sub.iloc[i]["s_opt_kwp"]) * sub.iloc[i]["selected"]
+        for i in range(n)
+    ]
+    sub["capex_annualised_eur"] = [
+        CRF * (capex_fix + capex_kwp * sub.iloc[i]["s_opt_kwp"]) * sub.iloc[i]["selected"]
+        for i in range(n)
+    ]
+
+    # ------------------------------------------------------------------
+    # Aggregate hourly dispatch → annual totals per building
+    # This is the correct way to compute self-sufficiency/self-consumption:
+    # from actual dispatch results, not from annual yield approximations.
+    # ------------------------------------------------------------------
+    sub["grid_import_kwh_yr"] = [
+        DAYS_PER_SEASON * sum(
+            (pulp.value(g[i][se][h]) or 0)
+            for se in SEASONS for h in HOURS
         )
+        for i in range(n)
+    ]
+    sub["pv_consumed_kwh_yr"] = [
+        DAYS_PER_SEASON * sum(
+            (pulp.value(p[i][se][h]) or 0)
+            for se in SEASONS for h in HOURS
+        )
+        for i in range(n)
+    ]
+    sub["pv_exported_kwh_yr"] = [
+        DAYS_PER_SEASON * sum(
+            (pulp.value(e[i][se][h]) or 0)
+            for se in SEASONS for h in HOURS
+        )
+        for i in range(n)
+    ]
 
-    # -------------------------------------------------------------------
-    # Extract results
-    # -------------------------------------------------------------------
-    selected = [bool(pulp.value(x[i])) for i in indices]
-    gdf["selected"] = selected
-
-    # -------------------------------------------------------------------
-    # Print summary
-    # -------------------------------------------------------------------
-    sel = gdf[gdf["selected"]]
-    total_yield  = sel["pv_yield_kwh_yr"].sum()
-    total_power  = sel["peak_power_kwp"].sum()
-    total_cost   = sel["cost_eur"].sum()
-
-    print(f"\n{'='*50}")
-    print(f"  OPTIMISATION RESULTS")
-    print(f"{'='*50}")
-    print(f"  Buildings selected:   {len(sel):,}  /  {n:,}")
-    print(f"  Total peak power:     {total_power:,.1f} kWp")
-    print(f"  Total annual yield:   {total_yield/1e3:,.1f} MWh/yr")
-    print(f"  Est. investment:      {total_cost/1e6:.2f} M EUR")
-    print(f"  Objective value:      {pulp.value(model.objective):,.1f} kWh/yr")
-    print(f"{'='*50}\n")
-
-    return gdf
-
-
-# ---------------------------------------------------------------------------
-# Save results
-# ---------------------------------------------------------------------------
-
-def save_results(gdf: gpd.GeoDataFrame) -> Path:
-    out_path = OUT_DIR / "optimisation_results_jork.gpkg"
-    gdf.to_file(out_path, driver="GPKG")
-    print(f"[Saved] Optimisation results → {out_path}")
-    return out_path
-
-
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
-
-def run(
-    max_peak_power_kwp: float = 5000.0,
-    min_buildings: int        = 10,
-    exclude_orchards: bool    = True,
-    max_cost_eur: float       = None,
-) -> gpd.GeoDataFrame:
-    """
-    Full pipeline: load → optimise → save.
-    Returns enriched GeoDataFrame with `selected` column.
-    """
-    gdf = load_pv_potential()
-    gdf = optimise(
-        gdf,
-        max_peak_power_kwp=max_peak_power_kwp,
-        min_buildings=min_buildings,
-        exclude_orchards=exclude_orchards,
-        max_cost_eur=max_cost_eur,
+    sub["annual_cost_eur"] = (
+        sub["grid_import_kwh_yr"] * c_grid
+      - sub["pv_exported_kwh_yr"] * c_feedin
     )
-    save_results(gdf)
-    return gdf
+    sub["total_annual_cost_eur"] = sub["capex_annualised_eur"] + sub["annual_cost_eur"]
+    sub["pv_yield_opt_kwh_yr"]   = sub["pv_consumed_kwh_yr"] + sub["pv_exported_kwh_yr"]
 
+    # ------------------------------------------------------------------
+    # Merge back into full GeoDataFrame
+    # New buildings have no osmid so we use a positional index approach:
+    # sub was built from gdf_full rows → track original index via helper col
+    # ------------------------------------------------------------------
+    result_cols = ["selected", "s_opt_kwp", "capex_eur", "capex_annualised_eur",
+                   "annual_cost_eur", "total_annual_cost_eur", "pv_yield_opt_kwh_yr",
+                   "grid_import_kwh_yr", "pv_consumed_kwh_yr", "pv_exported_kwh_yr"]
 
-if __name__ == "__main__":
-    print("=== PV Roof Optimiser – Jork / Altes Land ===\n")
+    # Store original gdf_full index in sub before reset_index was called
+    # We rebuild by adding a temp _orig_idx column before pre-filter
+    # Fallback: use positional merge via _sub_orig_idx stored earlier
+    if "_orig_idx" in sub.columns:
+        for col in result_cols:
+            gdf_full.loc[sub["_orig_idx"], col] = sub[col].values
+    elif "osmid" in gdf_full.columns and "osmid" in sub.columns:
+        # Only use osmid merge when osmid is unique and non-null
+        sub_clean = sub.dropna(subset=["osmid"])
+        sub_clean = sub_clean[~sub_clean["osmid"].duplicated(keep="first")]
+        sub_idx   = sub_clean.set_index("osmid")
+        mask = gdf_full["osmid"].isin(sub_idx.index) & gdf_full["osmid"].notna()
+        for col in result_cols:
+            gdf_full.loc[mask, col] = (
+                gdf_full.loc[mask, "osmid"].map(sub_idx[col])
+            )
+        # New buildings (no osmid) – merge positionally via sub index
+        no_osmid_sub  = sub[sub["osmid"].isna() | (sub["osmid"] == "")]
+        no_osmid_full = gdf_full[gdf_full["osmid"].isna() | (gdf_full["osmid"] == "")]
+        if len(no_osmid_sub) > 0 and len(no_osmid_full) > 0:
+            n_match = min(len(no_osmid_sub), len(no_osmid_full))
+            for col in result_cols:
+                gdf_full.loc[
+                    no_osmid_full.index[:n_match], col
+                ] = no_osmid_sub[col].values[:n_match]
+    else:
+        for col in result_cols:
+            gdf_full.loc[sub.index, col] = sub[col].values
 
-    # Example run: max 5 MW installed, at least 10 buildings, no orchards
-    gdf = run(
-        max_peak_power_kwp=5000,
-        min_buildings=10,
-        exclude_orchards=True,
-        max_cost_eur=None,       # no budget cap
-    )
+    # Clean up helper column
+    gdf_full = gdf_full.drop(columns=["_orig_idx"], errors="ignore")
 
-    print("Selected buildings:")
-    print(
-        gdf[gdf["selected"]][
-            ["building", "area_m2", "peak_power_kwp", "pv_yield_kwh_yr", "cost_eur"]
-        ].sort_values("pv_yield_kwh_yr", ascending=False).head(10)
-    )
+    # Summary
+    sel = gdf_full[gdf_full["selected"] == True]
+    print(f"  [MILP] Selected: {len(sel):,} buildings · "
+          f"{sel['s_opt_kwp'].sum():,.1f} kWp · "
+          f"CAPEX: {sel['capex_eur'].sum()/1e6:.2f} M€ · "
+          f"Net annual cost: {sel['annual_cost_eur'].sum():,.0f} €/yr")
+
+    return gdf_full

@@ -1,9 +1,9 @@
 [[pages]]
 path = "pages/intro.py"
-name = "Introduction Jork"
+name = "Jork · Densification vs. Urban Sprawl"
 icon = "🍎"
 
 [[pages]]
-path = "pages/optimiser.py"
-name = "PV optimiser"
+path = "pages/scenario_optimiser.py"
+name = "Optimiser Results"
 icon = "🎯"
